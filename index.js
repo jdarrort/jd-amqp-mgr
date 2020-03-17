@@ -2,22 +2,24 @@
 Handles connection to Rabbit MQ.
 One AMQP Channel is created per TSP. (getAMQPChannel)
 */
-
+const EventEmitter = require('events');
 const AMQP = require("amqplib");
 const RETRY_TIMER = 5000; //ms
 
 // opts for socket options and other attributes
-class AMQPMgr {
+class AMQPMgr extends EventEmitter {
     constructor(uri, opts) {
-        this.uri = uri || "amqp://app:app@localhost:5672";
+        super();
+        this.uri = uri ;
         this.is_started = false; 
+        this.is_connecting = false; 
         this.is_connected = false;
         if ( opts == null) opts = {};
         this.conn = null;
         this.conn_opts = opts || {};
         this.is_readonly = opts.readonly || false;
         this.id = 0;
-        this.channels={};
+        this.channels = {};
         this.log = this.warn = this.err = this.dbg = () => {};
         return this;
     }
@@ -26,11 +28,17 @@ class AMQPMgr {
     getChannelById(in_id)   { return this.channels[in_id]; }
     //--------------------------------------------
     async connect() {
-        this.is_started = true;
+        this.is_connecting = true;
+        let init_state = this.is_started;
         try {
             this.dbg("Trying to connect");
             this.conn = await AMQP.connect( this.uri );
-            process.on('SIGINT', async ()  => { await this.conn.close(); process.exit(0); });
+            // Graceful shutdown
+            process.on('SIGINT', ()  => { 
+                if(this.is_connected) {
+                    this.conn.close().then(e=>process.exit(0)).catch(e=>process.exit(1));
+                }
+            });
             this.conn.on("error", (err) =>  {
                 this.warn("AMQP CON error : " + err);
             });
@@ -39,15 +47,16 @@ class AMQPMgr {
                 this.is_connected = false;
                 this.retryConnect();
             });
-
             this.log("Connection Established");
-
+            this.is_started = true;
         } catch (e) {
             this.error("Failed to establish Connection to RMQ")
             this.retryConnect();
             return;
         }
+        this.is_connecting = false;
         this.is_connected = true;
+        if (!init_state) {this.emit('ready');}
         Object.keys(this.channels).forEach(id => {this.channels[id].connect();});
     }
 
@@ -55,7 +64,7 @@ class AMQPMgr {
     async checkQueues(in_queues){
         if (! this.is_connected ){ 
             this.warn("No connection to AMQP yet");
-            throw new Error("AMQP Connection is currently off");
+            throw new Error("AMQP Connection is currently off, retry later");
         }
         //   Check Queues existence
         let test_channel;
@@ -64,7 +73,7 @@ class AMQPMgr {
         } catch(e) {
             this.warn("Channel creation failed " + e.message )
             throw new Error("Channel creation failed " + e.message )
-        }            
+        }
         // Declare handler so conn doesn't close upon failure to check queue existence
         test_channel.on("error", (err) => {});
         test_channel.on("close", (err) => {});
@@ -81,10 +90,20 @@ class AMQPMgr {
     //--------------------------------------------
     // open a channel,to read/publish on certain queues/exchange
     async getChannel(in_queues, in_handler){
-        if ( ! this.is_started ) { await this.connect(); }
-        let queues = [];
+        if ( ! this.is_started && ! this.is_connecting ) { await this.connect(); }
+        if (  ! this.is_started && this.is_connecting ) { 
+            // Connection not yet available... should we queue request to later serve it?
+            return new Promise((resolve, reject) => {
+                this.log("getChannel for " + JSON.stringify(in_queues)+" is being queued until AMQP connection up")
+                this.on('ready', () => {
+                    this.getChannel(in_queues, in_handler).then(resolve).catch(reject);
+                })
+            })
+        }
+        let queues = []; 
         if( typeof in_queues === "string") { queues.push(in_queues); } 
         else if (Array.isArray(in_queues)) { queues = in_queues.slice();}
+        else if (in_queues === null) { }
         else {throw new Error("Invalid queues passed, expecting string or array of string");}
         // Before assigning a channel,  Check Queues existence
         try {
@@ -94,18 +113,20 @@ class AMQPMgr {
             throw e;
         }
         let channel_id = this.id++;
-        return this.channels[channel_id] = new AMQPTSPChannel(this, 
-            { 
-                id : channel_id, 
-                queues : queues, 
-                consumer_cb : in_handler,
-                opts : {readonly : this.is_readonly}
-            });
-        
+        try{
+            return this.channels[channel_id] = await new AMQPTSPChannel( this, 
+                { 
+                    id : channel_id, 
+                    queues : queues, 
+                    consumer_cb : in_handler,
+                    opts : {readonly : this.is_readonly}
+                });
+        } catch(e) {
+            this.warn("Failed to create Channel" + e.mess);
+            throw e;
+        }
     }
-
 } // end class AMQPMgr
-
 
 // Channel Listener/Publisher
 class AMQPTSPChannel {
@@ -114,10 +135,10 @@ class AMQPTSPChannel {
         this.id = opts.id;
         this.opts = opts;
         this.client_handler_fn = opts.consumer_cb;
+        this.is_initialized = false;
         this.is_available = false;
         this.opts.stats = { publish : {ok : 0, errors:0}, recv : {ok : 0, errors:0} ,deconnection:0}
-        this.connect();
-        return this;
+        return this.connect();
     }
     log(msg)  { this.parent.log (`AMQP-CH/${this.id} - ${msg}`) }
     dbg(msg)  { this.parent.dbg (`AMQP-CH/${this.id} - ${msg}`) }
@@ -173,9 +194,12 @@ class AMQPTSPChannel {
             });
             this.log("Channel  Established ");
             this.is_available = true;
+            this.is_initialized = true;
+            return this;
         } catch (e) {
             this.log("Channel establishment failed, rearm");
-            this.retryConnect();
+            if (this.is_initialized) {this.retryConnect();}
+            else throw e;
         }
     }
     //-------------------------------------------------------
