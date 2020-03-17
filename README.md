@@ -48,11 +48,14 @@ AMQP 0.9.1
   - `callback_fn` : function invoked upon message reception.  
   - All messages will be **acked**, even if `callback_fn` fails.
   - Request to `getChannel` will be queued until the first AMQP connection gets up. After first connection to AMQP, `getChannel` will fail if there is no ongoing connections.
+- `publish(exchange, routing_key, payload, headers,properties)` : Publishes a message on an amqp channel dedicated to publishing.
+  - `payload` is mandatory, object or array
+  - `headers` and `properties` are optional. note that the property content_type will necessarily be set to `application/json`
 
 
 ## **AMQPTSPChannel**
 - Represents a channel between the app and the RMQ server. Consumes on queues, and is able to publish message to exchanges. Automatic reconnection is covered.
-- `publish(exchange, routing_key, payload, headers, properties)` : Publish a message.  
+- `publish(exchange, routing_key, payload, headers, properties)` : Publish a message over this channel
   - Returns a Promise
   - `payload`,`headers`,`properties` must be object
   - Property `content_type` is automatically set to `application/json`  

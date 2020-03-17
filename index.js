@@ -1,6 +1,5 @@
 /*
 Handles connection to Rabbit MQ.
-One AMQP Channel is created per TSP. (getAMQPChannel)
 */
 const EventEmitter = require('events');
 const AMQP = require("amqplib");
@@ -20,7 +19,8 @@ class AMQPMgr extends EventEmitter {
         this.is_readonly = opts.readonly || false;
         this.id = 0;
         this.channels = {};
-        this.log = this.warn = this.err = this.dbg = () => {};
+        this.pub_channel = null;
+        this.log = this.warn = this.error = this.dbg = () => {};
         return this;
     }
     //--------------------------------------------
@@ -126,6 +126,25 @@ class AMQPMgr extends EventEmitter {
             throw e;
         }
     }
+    //--------------------------------------------
+    // Publish on the pub channel
+    async publish(exchange, routing_key, payload, headers, properties){
+        let data = Buffer.from(JSON.stringify(payload));
+        let props = Object.assign({contentType : "application/json"}, properties|| {});
+        props.headers = headers || {};
+        if (! this.is_connected ){ 
+            this.warn("No connection to AMQP yet");
+            throw new Error("AMQP Connection is currently off, retry later");
+        }
+        if (! this.pub_channel){
+            this.pub_channel = await this.conn.createChannel();
+            this.pub_channel.on('error', ()=>{})
+            this.pub_channel.on('close', ()=>{ this.pub_channel=null;})
+        }
+        //   Check Queues existence
+        let tmpchan;
+        this.pub_channel.publish(exchange, routing_key, data, props);
+    }    
 } // end class AMQPMgr
 
 // Channel Listener/Publisher
@@ -203,28 +222,15 @@ class AMQPTSPChannel {
         }
     }
     //-------------------------------------------------------
-    async publish( exchange, routing_key, payload, headers, properties) {
-        if (! this.is_available) { throw new Error("No connection available");}
+    publish( exchange, routing_key, payload, headers, properties) {
         if ( this.opts.readonly ) { throw new Error("Publishing is not authorized (readonly)");}
-        if ( ! payload || typeof payload !== "object" ) { throw new Error("Invalid payload");}
-        try {
-            let data = Buffer.from(JSON.stringify(payload));
-            let props = Object.assign({content_type : "application/json"},properties|| {});
-            props.headers = headers || {};
-            let res = await this.channel.publish(
+        this.opts.stats.publish.errors ++;
+        return this.parent.publish(
                 exchange, 
                 routing_key, 
                 data,
                 props
-            );
-            this.dbg(`Message published to ${exchange} -> ${routing_key} `);
-            this.opts.stats.publish.ok++;
-            return res;
-        } catch (e){
-            this.opts.stats.publish.errors ++;
-            this.warn(`FAILED to publish message to ${exchange} -> ${routing_key} : msg` + e.message);
-            throw new Error("AMQP Publish error " + e.message);
-        }
+        );
     }
 }
 
