@@ -32,7 +32,7 @@ class AMQPMgr extends EventEmitter {
         let init_state = this.is_started;
         try {
             this.dbg("Trying to connect");
-            this.conn = await AMQP.connect( this.uri );
+            this.conn = await AMQP.connect( this.uri ,this.conn_opts);
             // Graceful shutdown
             process.on('SIGINT', ()  => { 
                 if(this.is_connected) {
