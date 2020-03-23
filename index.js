@@ -15,7 +15,7 @@ class AMQPMgr extends EventEmitter {
         this.is_connected = false;
         if ( opts == null) opts = {};
         this.conn = null;
-        this.conn_opts = opts || {};
+        this.conn_opts = opts ;
         this.is_readonly = opts.readonly || false;
         this.id = 0;
         this.channels = {};
@@ -142,7 +142,7 @@ class AMQPMgr extends EventEmitter {
             this.pub_channel.on('close', ()=>{ this.pub_channel=null;})
         }
         //   Check Queues existence
-        let tmpchan;
+        this.dbg(`About to publish to ${exchange}/${routin<g_key} \n payload = ${JSON.stringify(data)} \n properties = ${props?JSON.stringify(props) :null}`);
         this.pub_channel.publish(exchange, routing_key, data, props);
     }    
 } // end class AMQPMgr
@@ -228,8 +228,9 @@ class AMQPTSPChannel {
         return this.parent.publish(
                 exchange, 
                 routing_key, 
-                data,
-                props
+                payload,
+                headers,
+                properties
         );
     }
 }
