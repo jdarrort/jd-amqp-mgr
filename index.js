@@ -66,6 +66,9 @@ class AMQPMgr extends EventEmitter {
             this.warn("No connection to AMQP yet");
             throw new Error("AMQP Connection is currently off, retry later");
         }
+        let tested_queues = []
+        if (typeof in_queues === "string")  { tested_queues.push(in_queues)}
+        else {tested_queues = in_queues;}
         //   Check Queues existence
         let test_channel;
         try {
@@ -77,11 +80,11 @@ class AMQPMgr extends EventEmitter {
         // Declare handler so conn doesn't close upon failure to check queue existence
         test_channel.on("error", (err) => {});
         test_channel.on("close", (err) => {});
-        for (let i in in_queues) {
+        for (let i in tested_queues) {
             try {
-                await test_channel.checkQueue(in_queues[i])
+                await test_channel.checkQueue(tested_queues[i])
             } catch (e) {
-                throw new Error(`CheckQueue failed for '${in_queues[i]}' => ${e.code}`)
+                throw new Error(`CheckQueue failed for '${tested_queues[i]}' => ${e.code}`)
             }
         }
         test_channel.close();
@@ -102,7 +105,7 @@ class AMQPMgr extends EventEmitter {
         }
         let queues = []; 
         if( typeof in_queues === "string") { queues.push(in_queues); } 
-        else if (Array.isArray(in_queues)) { queues = in_queues.slice();}
+        else if (Array.isArray(in_queues)) { queues = in_queues.slice();} // shallow copy
         else if (in_queues === null) { }
         else {throw new Error("Invalid queues passed, expecting string or array of string");}
         // Before assigning a channel,  Check Queues existence
@@ -119,12 +122,21 @@ class AMQPMgr extends EventEmitter {
                     id : channel_id, 
                     queues : queues, 
                     consumer_cb : in_handler,
-                    opts : {readonly : this.is_readonly}
+                    readonly : this.is_readonly
                 });
         } catch(e) {
             this.warn("Failed to create Channel" + e.mess);
             throw e;
         }
+    }
+    //--------------------------------------------
+    //removes a channel (to prevent from them to reconnect)
+    removeChannel( in_channel_id ) {
+        let channel = this.getChannelById(in_channel_id);
+        if ( ! channel ) { throw new Error("Channel not found");}
+        delete this.channels[in_channel_id];
+        this.log(`Removed channel ${in_channel_id}`);
+
     }
     //--------------------------------------------
     // Publish on the pub channel
@@ -142,7 +154,7 @@ class AMQPMgr extends EventEmitter {
             this.pub_channel.on('close', ()=>{ this.pub_channel=null;})
         }
         //   Check Queues existence
-        this.dbg(`About to publish to ${exchange}/${routin<g_key} \n payload = ${JSON.stringify(data)} \n properties = ${props?JSON.stringify(props) :null}`);
+        this.dbg(`About to publish to ${exchange}/${routing_key} \n payload = ${JSON.stringify(payload)} \n properties = ${JSON.stringify(props)}`);
         this.pub_channel.publish(exchange, routing_key, data, props);
     }    
 } // end class AMQPMgr
@@ -156,6 +168,7 @@ class AMQPTSPChannel {
         this.client_handler_fn = opts.consumer_cb;
         this.is_initialized = false;
         this.is_available = false;
+        this.is_deleted = false;
         this.opts.stats = { publish : {ok : 0, errors:0}, recv : {ok : 0, errors:0} ,deconnection:0}
         return this.connect();
     }
@@ -206,7 +219,9 @@ class AMQPTSPChannel {
                 // Rearm connection
                 this.warn("Event -  Got  close : " + err);
                 this.opts.stats.deconnection ++;
-                this.retryConnect();
+                if (! this.is_deleted) {
+                    this.retryConnect();
+                }
             });
             this.opts.queues.forEach(q => {
                 this.channel.consume(q, (msg)=>{this.consumerFn(msg)});
@@ -233,6 +248,35 @@ class AMQPTSPChannel {
                 properties
         );
     }
+    //-------------------------------------------------------
+    addQueues(new_queues) { // array of queues name
+        if (! Array.isArray(new_queues)) { throw new Error("addQueues expect an array of queue names")}
+        if ( ! this.is_available ) {
+            throw new Error("Channel not available");
+        }
+        //check queues existence first.
+        this.parent.checkQueues(new_queues);
+        new_queues.forEach( q => {
+            if ( this.opts.queues.indexOf(q) >= 0 ){ 
+                this.warn(`Queue ${q} is already consumed in this channel`);
+                return;
+            }
+            this.channel.consume( q, (msg) => { this.consumerFn(msg) } )
+            this.opts.queues.push(q);
+        });
+    }
+    //-------------------------------------------------------
+    close() { // Closes a Channel
+        this.log("Channel is being closed");
+        this.is_deleted = true;
+        this.parent.removeChannel(this.opts.id);
+        this.channel.removeAllListeners('close');
+        this.channel.removeAllListeners('error');
+        delete this.client_handler_fn;
+        this.channel.close();
+        return true;
+    }
+
 }
 
 module.exports = AMQPMgr;
