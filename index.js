@@ -328,13 +328,19 @@ class AMQPTSPChannel {
     }
     //-------------------------------------------------------
     resume(in_queue) { // pause consume on channel queues
-        if (in_queue) {
-            let queue = this.queues.find(q => (q.name ==in_queue));
-            if (queue) { queue.pause = false;}
-        } else { // all queues
-            this.queues.forEach(q => {q.pause = false;}) 
+        let queue = this.queues.find(q => (q.name ==in_queue));
+        if (! queue) { throw new Error("Queue not defined for this channel");}
+        if (! queue.pause == true) { 
+            this.log("Queue is not currently paused");
+            return true;
         }
-        return this._consumeQueues();
+        
+        return this.channel.consume( queue.name, (msg)=>{ this.consumerFn(msg, queue.name)})
+            .then( (res) => {
+                this.log(`Resuming consume on ${queue.name} , consumer_tag ${res.consumerTag}`)
+                queue.consumer_tag = res.consumerTag;
+                queue.pause = false;
+            });        
     }
     //-------------------------------------------------------
     publish( exchange, routing_key, payload, headers, properties) {
