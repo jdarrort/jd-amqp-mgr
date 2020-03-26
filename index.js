@@ -165,44 +165,56 @@ class AMQPTSPChannel {
         this.parent = parent;
         this.id = opts.id;
         this.opts = opts;
+        this.queues = [];
+        this.opts.queues.forEach(q => { this.queues.push( {name : q, consumer_tag : null, count:0})});
         this.client_handler_fn = opts.consumer_cb;
         this.is_initialized = false;
         this.is_available = false;
         this.is_deleted = false;
+        this.is_paused = false;
         this.opts.stats = { publish : {ok : 0, errors:0}, recv : {ok : 0, errors:0} ,deconnection:0}
         return this.connect();
     }
+    
     log(msg)  { this.parent.log (`AMQP-CH/${this.id} - ${msg}`) }
     dbg(msg)  { this.parent.dbg (`AMQP-CH/${this.id} - ${msg}`) }
     warn(msg) { this.parent.warn(`AMQP-CH/${this.id} - ${msg}`) }
     error(msg){ this.parent.error(`AMQP-CH/${this.id} - ${msg}`) }
     //-------------------------------------------------------
-    consumerFn(msg){
+    getInfos() { return this.opts;}
+    //-------------------------------------------------------
+    consumerFn( msg, from_queue){
         this.log(`Received ${msg.fields.routingKey}`);
-        this.channel.ack(msg); // Don't requeue
         let msg2;
         try {
             let props = {};
             Object.keys(msg.properties)
                 .filter(p => (msg.properties[p] && p !== "headers"))
                 .forEach(p => {props[p] = msg.properties[p]});
-
+            let payload = msg.content.toString();
+            try{
+                payload = JSON.parse(payload);
+            } catch( e ) { this.dbg("message payload is not JSON");}
             msg2 =  {
                 exchange : msg.fields.exchange,
+                queue : from_queue,
                 routing_key : msg.fields.routingKey,
                 headers : msg.properties.headers,
-                payload : JSON.parse(msg.content.toString()),
+                payload : payload,
                 properties : props
             }
             this.client_handler_fn( msg2 );
+            this.channel.ack(msg); // ACK message
             this.opts.stats.recv.ok++;
+            let q = this.queues.find( q => (q.name ==  from_queue));
+            if (q) q.count++;
         } catch (e) {
+            this.channel.nack(msg); // nack message
             this.opts.stats.recv.errors++;
             this.warn("Failed to process message " + JSON.stringify(msg));
         }
     }
     //-------------------------------------------------------
-    getInfos() { return this.opts;}
     async retryConnect() { setTimeout(() => { this.connect()}, RETRY_TIMER);}
     async connect() {
         if ( ! this.parent.is_connected ) {
@@ -218,14 +230,14 @@ class AMQPTSPChannel {
                 this.is_available = false;
                 // Rearm connection
                 this.warn("Event -  Got  close : " + err);
+                this.queues.forEach( q => {  q.consumer_tag = null;});
                 this.opts.stats.deconnection ++;
                 if (! this.is_deleted) {
                     this.retryConnect();
                 }
             });
-            this.opts.queues.forEach(q => {
-                this.channel.consume(q, (msg)=>{this.consumerFn(msg)});
-            });
+            this._consumeQueues();
+
             this.log("Channel  Established ");
             this.is_available = true;
             this.is_initialized = true;
@@ -235,6 +247,94 @@ class AMQPTSPChannel {
             if (this.is_initialized) {this.retryConnect();}
             else throw e;
         }
+    }
+    _consumeQueues(){
+        let promises = [];
+        this.queues.filter(q => (! q.consumer_tag && ! q.pause))
+            .forEach( q => {
+                let p = this.channel.consume( q.name, (msg)=>{ this.consumerFn(msg, q.name)})
+                .then( (res) => {
+                    this.log(`Starting consume on ${q.name} , consumer_tag ${res.consumerTag}`)
+                    q.consumer_tag = res.consumerTag;
+                promises.push(p);
+                });
+            });
+        return Promise.all(promises);
+    }
+
+    //-------------------------------------------------------
+    addQueues(new_queues) { // array of queues name
+        if (! Array.isArray(new_queues)) { throw new Error("addQueues expect an array of queue names")}
+        if ( ! this.is_available ) {
+            throw new Error("Channel not available");
+        }
+        //check queues existence first.
+        return this.parent.checkQueues(new_queues)
+            .then( () => {
+                new_queues.forEach( q => {
+                    if ( this.queues.find( t => (t.name == q)) ){ 
+                        this.warn(`Queue ${q} is already consumed in this channel`);
+                        return;
+                    }
+                    this.queues.push({name : q, count:0, consumer_tag:null});
+                });      
+                return this._consumeQueues();
+            })
+            .catch(e => {
+                this.error(`AddQueues failed ${e.message}`);
+                throw e;
+            });
+    }
+    //-------------------------------------------------------
+    removeQueues(old_queues) { // array of queues name
+        if (! Array.isArray(old_queues)) { throw new Error("removeQueues expect an array of queue names")}
+
+        if ( ! this.is_available ) { // offline case
+            this.queues.forEach(q => {
+                if (old_queues.indexOf(q.name)){
+                        this.log(`Removing queue ${q.name} (offline)`)
+                        delete this.queues[q.name];
+                }
+            })
+            return true;
+        } 
+        // Otherwise, pause queues, and then delete them.
+        return this.pause(old_queues)
+            .then(q => {
+                if (old_queues.indexOf(q.name)){
+                    this.log(`Removing queue ${q.name} (offline)`)
+                    delete this.queues[q.name];
+                }
+            });
+    }    
+    //-------------------------------------------------------
+    pause( in_queue ) { // pause consume
+        let promises = [];
+        let queues_to_pause = this.queues;
+        if (in_queue) { 
+            queues_to_pause = this.queues.filter(q => (q.name == in_queue));
+        }
+        queues_to_pause.forEach( q => { 
+            q.pause = true;
+            if ( q.consumer_tag ) {
+                let p = this.channel.cancel( q.consumer_tag )
+                .then( () => {
+                    this.log( `Paused consume for queue  ${q.name} with consumer tag ${q.consumer_tag}` );
+                    q.consumer_tag = null;
+                })
+                promises.push( p );
+            }});
+        return Promise.all( promises );
+    }
+    //-------------------------------------------------------
+    resume(in_queue) { // pause consume on channel queues
+        if (in_queue) {
+            let queue = this.queues.find(q => (q.name ==in_queue));
+            if (queue) { queue.pause = false;}
+        } else { // all queues
+            this.queues.forEach(q => {q.pause = false;}) 
+        }
+        return this._consumeQueues();
     }
     //-------------------------------------------------------
     publish( exchange, routing_key, payload, headers, properties) {
@@ -247,24 +347,7 @@ class AMQPTSPChannel {
                 headers,
                 properties
         );
-    }
-    //-------------------------------------------------------
-    addQueues(new_queues) { // array of queues name
-        if (! Array.isArray(new_queues)) { throw new Error("addQueues expect an array of queue names")}
-        if ( ! this.is_available ) {
-            throw new Error("Channel not available");
-        }
-        //check queues existence first.
-        this.parent.checkQueues(new_queues);
-        new_queues.forEach( q => {
-            if ( this.opts.queues.indexOf(q) >= 0 ){ 
-                this.warn(`Queue ${q} is already consumed in this channel`);
-                return;
-            }
-            this.channel.consume( q, (msg) => { this.consumerFn(msg) } )
-            this.opts.queues.push(q);
-        });
-    }
+    }    
     //-------------------------------------------------------
     close() { // Closes a Channel
         this.log("Channel is being closed");

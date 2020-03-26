@@ -1,6 +1,6 @@
 {
   "name": "jd-amqp-mgr",
-  "version": "0.1.13",
+  "version": "0.1.15",
   "description": "AMQP connection Manager using amqplib",
   "main": "index.js",
   "scripts": {
