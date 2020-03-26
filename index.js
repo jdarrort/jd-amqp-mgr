@@ -182,9 +182,15 @@ class AMQPTSPChannel {
     error(msg){ this.parent.error(`AMQP-CH/${this.id} - ${msg}`) }
     //-------------------------------------------------------
     getInfos() { return this.opts;}
+    getQueue(in_queue_name) { return this.queues.find(q => q.name == in_queue_name);}
+    deleteQueue(in_queue_name) { 
+        let idx =  this.queues.findIndex(q => q.name == in_queue_name);
+        if (idx >= 0) {this.queues.splice(idx, 1);}
+    }
     //-------------------------------------------------------
     consumerFn( msg, from_queue){
         this.log(`Received ${msg.fields.routingKey}`);
+        let queue = this.getQueue(from_queue); if (queue) { queue.count++;}
         let msg2;
         try {
             let props = {};
@@ -272,8 +278,8 @@ class AMQPTSPChannel {
         return this.parent.checkQueues(new_queues)
             .then( () => {
                 new_queues.forEach( q => {
-                    if ( this.queues.find( t => (t.name == q)) ){ 
-                        this.warn(`Queue ${q} is already consumed in this channel`);
+                    if ( this.getQueue(q) ){ 
+                        this.warn(`Queue ${q} is already part of this channel`);
                         return;
                     }
                     this.queues.push({name : q, count:0, consumer_tag:null});
@@ -286,29 +292,26 @@ class AMQPTSPChannel {
             });
     }
     //-------------------------------------------------------
-    removeQueues(old_queues) { // array of queues name
-        if (! Array.isArray(old_queues)) { throw new Error("removeQueues expect an array of queue names")}
-
+    removeQueue(todelete_queue) { // array of queues name
+        let queue = this.getQueue(todelete_queue);
+        if (! queue) { 
+            this.log("Nothing to remove");
+            return true;
+        }
         if ( ! this.is_available ) { // offline case
-            this.queues.forEach(q => {
-                if (old_queues.indexOf(q.name)){
-                        this.log(`Removing queue ${q.name} (offline)`)
-                        delete this.queues[q.name];
-                }
-            })
+            this.log(`Removed queue ${todelete_queue} (offline) `)
+            this.deleteQueue(todelete_queue)
             return true;
         } 
         // Otherwise, pause queues, and then delete them.
-        return this.pause(old_queues)
-            .then(q => {
-                if (old_queues.indexOf(q.name)){
-                    this.log(`Removing queue ${q.name} (offline)`)
-                    delete this.queues[q.name];
-                }
+        return this.pause(todelete_queue)
+            .then(() => {
+                this.deleteQueue(todelete_queue)
+                this.log(`Removed queue ${todelete_queue} (online) `)
             });
     }    
     //-------------------------------------------------------
-    pause( in_queue ) { // pause consume
+    pause( in_queue ) { // pause consume on all(when no in_queue) or an a specific queue.
         let promises = [];
         let queues_to_pause = this.queues;
         if (in_queue) { 
@@ -328,7 +331,7 @@ class AMQPTSPChannel {
     }
     //-------------------------------------------------------
     resume(in_queue) { // pause consume on channel queues
-        let queue = this.queues.find(q => (q.name ==in_queue));
+        let queue = this.getQueue(in_queue);
         if (! queue) { throw new Error("Queue not defined for this channel");}
         if (! queue.pause == true) { 
             this.log("Queue is not currently paused");
@@ -362,6 +365,7 @@ class AMQPTSPChannel {
         this.channel.removeAllListeners('close');
         this.channel.removeAllListeners('error');
         delete this.client_handler_fn;
+        delete this.queues;
         this.channel.close();
         return true;
     }
