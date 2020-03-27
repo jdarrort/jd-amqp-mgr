@@ -3,7 +3,7 @@ Handles connection to Rabbit MQ.
 */
 const EventEmitter = require('events');
 const AMQP = require("amqplib");
-const RETRY_TIMER = 5000; //ms
+const DEFAULT_RECONNECT_DELAY = 15000; //ms
 
 // opts for socket options and other attributes
 class AMQPMgr extends EventEmitter {
@@ -15,7 +15,10 @@ class AMQPMgr extends EventEmitter {
         this.is_connected = false;
         if ( opts == null) opts = {};
         this.conn = null;
-        this.conn_opts = opts ;
+        this.conn_opts= {
+            reconnect_delay : DEFAULT_RECONNECT_DELAY
+        };
+        this.conn_opts = Object.assign(this.conn_opts, opts) ;
         this.is_readonly = opts.readonly || false;
         this.id = 0;
         this.channels = {};
@@ -24,12 +27,12 @@ class AMQPMgr extends EventEmitter {
         return this;
     }
     //--------------------------------------------
-    retryConnect()          { setTimeout(() => { this.connect(); } , RETRY_TIMER); }
+    retryConnect()          { setTimeout(() => { this.connect(); } , this.conn_opts.reconnect_delay); }
     getChannelById(in_id)   { return this.channels[in_id]; }
     //--------------------------------------------
     async connect() {
         this.is_connecting = true;
-        let init_state = this.is_started;
+        let first_start = this.is_started ? false: true;
         try {
             this.dbg("Trying to connect");
             this.conn = await AMQP.connect( this.uri ,this.conn_opts);
@@ -45,6 +48,7 @@ class AMQPMgr extends EventEmitter {
             this.conn.on("close", (err) =>  {
                 this.warn("AMQP CON close : " + err);
                 this.is_connected = false;
+                this.emit('disconnected');
                 this.retryConnect();
             });
             this.log("Connection Established");
@@ -56,7 +60,7 @@ class AMQPMgr extends EventEmitter {
         }
         this.is_connecting = false;
         this.is_connected = true;
-        if (!init_state) {this.emit('ready');}
+        this.emit( first_start ? 'ready' : 'connected');
         Object.keys(this.channels).forEach(id => {this.channels[id].connect();});
     }
 
@@ -221,7 +225,7 @@ class AMQPTSPChannel {
         }
     }
     //-------------------------------------------------------
-    async retryConnect() { setTimeout(() => { this.connect()}, RETRY_TIMER);}
+    async retryConnect() { setTimeout(() => { this.connect()}, DEFAULT_RECONNECT_DELAY);}
     async connect() {
         if ( ! this.parent.is_connected ) {
             this.log("No connection available,  will be rearmed when connection gets up again");
